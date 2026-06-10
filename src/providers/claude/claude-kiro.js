@@ -2256,131 +2256,90 @@ async saveCredentialsToFile(filePath, newData) {
      */
     parseAwsEventStreamBuffer(buffer) {
         const events = [];
-        let remaining = buffer;
-        let searchStart = 0;
+        let offset = 0;
         
-        while (true) {
-            // 查找真正的 JSON payload 起始位置。AWS Event Stream 包含二进制头部，
-            // payload 对象里的 key 顺序不稳定，所以不能依赖 {"input": 这类固定开头。
-            const jsonStart = remaining.indexOf('{', searchStart);
-            if (jsonStart < 0) break;
+        while (buffer.length - offset >= 16) {
+            const totalLength = buffer.readUInt32BE(offset);
+            const headersLength = buffer.readUInt32BE(offset + 4);
             
-            // 正确处理嵌套的 {} - 使用括号计数法
-            let braceCount = 0;
-            let jsonEnd = -1;
-            let inString = false;
-            let escapeNext = false;
-            
-            for (let i = jsonStart; i < remaining.length; i++) {
-                const char = remaining[i];
-                
-                if (escapeNext) {
-                    escapeNext = false;
-                    continue;
-                }
-                
-                if (char === '\\') {
-                    escapeNext = true;
-                    continue;
-                }
-                
-                if (char === '"') {
-                    inString = !inString;
-                    continue;
-                }
-                
-                if (!inString) {
-                    if (char === '{') {
-                        braceCount++;
-                    } else if (char === '}') {
-                        braceCount--;
-                        if (braceCount === 0) {
-                            jsonEnd = i;
-                            break;
-                        }
-                    }
-                }
-            }
-            
-            if (jsonEnd < 0) {
-                // 不完整的 JSON，保留在缓冲区等待更多数据
-                remaining = remaining.substring(jsonStart);
-                break;
-            }
-            
-            const jsonStr = remaining.substring(jsonStart, jsonEnd + 1);
-            try {
-                const parsed = JSON.parse(jsonStr);
-                // 处理 thinking/reasoning 事件
-                if (parsed.text !== undefined) {
-                    events.push({ type: 'thinking', data: parsed.text });
-                }
-                // 处理 content 事件
-                else if (parsed.content !== undefined && !parsed.followupPrompt) {
-                    // 处理转义字符
-                    let decodedContent = parsed.content;
-                    // 无须处理转义的换行符，原来要处理是因为智能体返回的 content 需要通过换行符切割不同的json
-                    // decodedContent = decodedContent.replace(/(?<!\\)\\n/g, '\n');
-                    events.push({ type: 'content', data: decodedContent });
-                }
-                // 处理结构化工具调用事件 - 开始事件（包含 name 和 toolUseId）
-                else if (parsed.name && parsed.toolUseId) {
-                    events.push({ 
-                        type: 'toolUse', 
-                        data: {
-                            name: parsed.name,
-                            toolUseId: parsed.toolUseId,
-                            input: normalizeKiroToolInput(parsed.input),
-                            stop: parsed.stop || false
-                        }
-                    });
-                }
-                // 处理工具调用的 input 续传事件（可能包含 toolUseId，且 key 顺序不固定）
-                else if (parsed.input !== undefined && !parsed.name) {
-                    events.push({
-                        type: 'toolUseInput',
-                        data: {
-                            toolUseId: parsed.toolUseId,
-                            input: normalizeKiroToolInput(parsed.input)
-                        }
-                    });
-                }
-                // 处理工具调用的结束事件（只有 stop 字段，且不包含 contextUsagePercentage）
-                else if (parsed.stop !== undefined && parsed.contextUsagePercentage === undefined) {
-                    events.push({
-                        type: 'toolUseStop',
-                        data: {
-                            stop: parsed.stop
-                        }
-                    });
-                }
-                // 处理上下文使用百分比事件（最后一条消息）
-                else if (parsed.contextUsagePercentage !== undefined) {
-                    events.push({
-                        type: 'contextUsage',
-                        data: {
-                            contextUsagePercentage: parsed.contextUsagePercentage
-                        }
-                    });
-                }
-            } catch (e) {
-                // JSON 解析失败，跳过这个 "{" 继续搜索，避免二进制头部中的偶然字符阻塞后续 payload
-                searchStart = jsonStart + 1;
+            // Safety checks to prevent infinite loops or corrupt memory access
+            if (totalLength < 16 || totalLength > 10 * 1024 * 1024) {
+                logger.error(`[Kiro] Invalid totalLength in EventStream: ${totalLength} at offset ${offset}`);
+                offset += 1;
                 continue;
             }
             
-            searchStart = jsonEnd + 1;
-            if (searchStart >= remaining.length) {
-                remaining = '';
+            if (buffer.length - offset < totalLength) {
+                // Incomplete message
                 break;
             }
+            
+            const payloadOffset = offset + 12 + headersLength;
+            const payloadLength = totalLength - headersLength - 16;
+            
+            if (payloadLength > 0) {
+                const payloadBuffer = buffer.subarray(payloadOffset, payloadOffset + payloadLength);
+                const payloadStr = payloadBuffer.toString('utf8');
+                
+                try {
+                    const parsed = JSON.parse(payloadStr);
+                    // 处理 thinking/reasoning 事件
+                    if (parsed.text !== undefined) {
+                        events.push({ type: 'thinking', data: parsed.text });
+                    }
+                    // 处理 content 事件
+                    else if (parsed.content !== undefined && !parsed.followupPrompt) {
+                        events.push({ type: 'content', data: parsed.content });
+                    }
+                    // 处理结构化工具调用事件 - 开始事件（包含 name 和 toolUseId）
+                    else if (parsed.name && parsed.toolUseId) {
+                        events.push({ 
+                            type: 'toolUse', 
+                            data: {
+                                name: parsed.name,
+                                toolUseId: parsed.toolUseId,
+                                input: normalizeKiroToolInput(parsed.input),
+                                stop: parsed.stop || false
+                            }
+                        });
+                    }
+                    // 处理工具调用的 input 续传事件
+                    else if (parsed.input !== undefined && !parsed.name) {
+                        events.push({
+                            type: 'toolUseInput',
+                            data: {
+                                toolUseId: parsed.toolUseId,
+                                input: normalizeKiroToolInput(parsed.input)
+                            }
+                        });
+                    }
+                    // 处理工具调用的结束事件
+                    else if (parsed.stop !== undefined && parsed.contextUsagePercentage === undefined) {
+                        events.push({
+                            type: 'toolUseStop',
+                            data: {
+                                stop: parsed.stop
+                            }
+                        });
+                    }
+                    // 处理上下文使用百分比事件
+                    else if (parsed.contextUsagePercentage !== undefined) {
+                        events.push({
+                            type: 'contextUsage',
+                            data: {
+                                contextUsagePercentage: parsed.contextUsagePercentage
+                            }
+                        });
+                    }
+                } catch (e) {
+                    logger.warn(`[Kiro] Failed to parse AWS EventStream JSON payload: ${e.message}`);
+                }
+            }
+            
+            offset += totalLength;
         }
         
-        // 如果 searchStart 有进展，截取剩余部分
-        if (searchStart > 0 && remaining.length > 0) {
-            remaining = remaining.substring(searchStart);
-        }
-        
+        const remaining = offset > 0 ? buffer.subarray(offset) : buffer;
         return { events, remaining };
     }
 
@@ -2437,11 +2396,11 @@ async saveCredentialsToFile(filePath, newData) {
             const response = await this.axiosInstance.request(axiosConfig);
 
             stream = response.data;
-            let buffer = '';
+            let buffer = Buffer.alloc(0);
             let lastContentEvent = null;  // 用于检测连续重复的 content 事件
 
             for await (const chunk of stream) {
-                buffer += chunk.toString();
+                buffer = Buffer.concat([buffer, chunk]);
                 
                 // 解析缓冲区中的事件
                 const { events, remaining } = this.parseAwsEventStreamBuffer(buffer);
