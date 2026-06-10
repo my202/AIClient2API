@@ -154,7 +154,7 @@ function normalizeKiroToolInput(input) {
 
 // Per-model context window sizes for accurate token estimation
 const MODEL_CONTEXT_TOKENS = {
-    "claude-auto": 200000,
+    "claude-auto": 1000000,
     "claude-opus-4-8": 1000000,
     "claude-opus-4.8": 1000000,
     "claude-opus-4-7": 1000000,
